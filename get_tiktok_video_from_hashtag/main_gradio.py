@@ -11,16 +11,120 @@ import re
 import pandas as pd
 from datetime import datetime
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import matplotlib.pyplot as plt
 import tempfile
 import os
 from openpyxl import load_workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Font, Alignment, PatternFill
+import threading
+from collections import deque
 
 # Global variables
 driver = None
-API_KEY = 'AIzaSyBkbdni528jYjh4Igj5GAvHDV6q4hrR6Kk'
+
+# API Key Management System
+class APIKeyManager:
+    def __init__(self, api_keys):
+        self.api_keys = deque(api_keys)
+        self.current_key = None
+        self.failed_keys = set()
+        self.lock = threading.Lock()
+        self._get_next_key()
+    
+    def _get_next_key(self):
+        """Lấy key tiếp theo từ queue"""
+        with self.lock:
+            if len(self.api_keys) == 0:
+                # Reset queue nếu đã hết key
+                self.api_keys = deque([k for k in List_API_KEY if k not in self.failed_keys])
+                if len(self.api_keys) == 0:
+                    # Nếu tất cả key đều failed, reset lại toàn bộ
+                    self.failed_keys.clear()
+                    self.api_keys = deque(List_API_KEY)
+            
+            if self.api_keys:
+                self.current_key = self.api_keys.popleft()
+                print(f"🔑 Đang sử dụng API Key: {self.current_key[:8]}...")
+            return self.current_key
+    
+    def get_current_key(self):
+        """Lấy key hiện tại"""
+        return self.current_key
+    
+    def mark_key_failed(self, error_msg=""):
+        """Đánh dấu key hiện tại là failed và chuyển sang key tiếp theo"""
+        with self.lock:
+            if self.current_key:
+                self.failed_keys.add(self.current_key)
+                print(f"❌ API Key {self.current_key[:8]}... đã failed: {error_msg}")
+                self._get_next_key()
+                print(f"🔄 Chuyển sang API Key mới: {self.current_key[:8]}...")
+    
+    def is_quota_error(self, error):
+        """Kiểm tra xem có phải lỗi quota không"""
+        if isinstance(error, HttpError):
+            error_details = str(error)
+            quota_indicators = [
+                "quotaExceeded", 
+                "dailyLimitExceeded",
+                "rateLimitExceeded",
+                "quota exceeded",
+                "daily limit exceeded",
+                "rate limit exceeded"
+            ]
+            return any(indicator.lower() in error_details.lower() for indicator in quota_indicators)
+        return False
+    
+    def execute_with_retry(self, func, *args, **kwargs):
+        """Thực thi function với retry khi gặp lỗi quota"""
+        max_retries = len(List_API_KEY)
+        
+        for attempt in range(max_retries):
+            try:
+                current_key = self.get_current_key()
+                if not current_key:
+                    raise Exception("Không còn API key khả dụng")
+                
+                # Thêm api_key vào kwargs
+                kwargs['api_key'] = current_key
+                result = func(*args, **kwargs)
+                return result
+                
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Kiểm tra nếu là lỗi quota hoặc key bị chặn
+                if (self.is_quota_error(e) or 
+                    "forbidden" in error_msg.lower() or
+                    "invalid" in error_msg.lower() or
+                    "disabled" in error_msg.lower()):
+                    
+                    self.mark_key_failed(error_msg)
+                    
+                    if attempt == max_retries - 1:
+                        raise Exception(f"Tất cả API key đều failed. Lỗi cuối: {error_msg}")
+                    
+                    print(f"⚠️ Đang thử lại với API key mới... (lần {attempt + 1}/{max_retries})")
+                    time.sleep(1)  # Delay một chút trước khi retry
+                    continue
+                else:
+                    # Lỗi khác không liên quan đến API key
+                    raise e
+        
+        raise Exception("Đã hết số lần thử")
+
+# Khởi tạo API Key Manager global
+List_API_KEY = [
+    'AIzaSyBkbdni528jYjh4Igj5GAvHDV6q4hrR6Kk',
+    'AIzaSyBvtOpz_xQTxaCYJGMyT9OIKtu-nlAPdvw',
+    'AIzaSyC1EOQa2qAief4m6tWmWCygeqRDmdUKMUQ',
+    'AIzaSyBgnX69psjLuqYvX5U_J8MnY2-PEHOLs3c',
+    'AIzaSyBLI0ABhHbkTVE0x9ZgDMxwZhwkHuLp6Ec'
+]
+
+api_manager = APIKeyManager(List_API_KEY)
 
 def format_number(num):
     """Format số thành dạng K, M, B"""
@@ -208,8 +312,10 @@ def get_channels_info_by_ids(channel_ids, api_key):
     response = request.execute()
     return response.get('items', [])
 
-def get_multiple_channels_from_urls_batch(channel_urls, api_key):
-    """Lấy thông tin nhiều kênh từ danh sách URLs"""
+def get_multiple_channels_from_urls_batch(channel_urls):
+    """Lấy thông tin nhiều kênh từ danh sách URLs với API key rotation"""
+    global api_manager
+    
     all_data = []
     id_url_map = {}
     ids = []
@@ -224,11 +330,12 @@ def get_multiple_channels_from_urls_batch(channel_urls, api_key):
         else:
             fallback_urls.append(url)
 
-    # Chia batch 50 id/lần
+    # Chia batch 50 id/lần với retry mechanism
     for i in range(0, len(ids), 50):
         batch_ids = ids[i:i+50]
         try:
-            items = get_channels_info_by_ids(batch_ids, api_key)
+            # Sử dụng API manager để execute với retry
+            items = api_manager.execute_with_retry(get_channels_info_by_ids, batch_ids)
             for item in items:
                 all_data.append({
                     'id': item['id'],
@@ -245,7 +352,8 @@ def get_multiple_channels_from_urls_batch(channel_urls, api_key):
     # Với các url không có channel_id
     for url in fallback_urls:
         try:
-            channel_items = get_channel_info_from_url(url, api_key)
+            # Sử dụng API manager để execute với retry  
+            channel_items = api_manager.execute_with_retry(get_channel_info_from_url, url)
             for item in channel_items:
                 all_data.append({
                     'id': item['id'],
@@ -417,8 +525,8 @@ def search_channels(hashtag, limit, progress=gr.Progress()):
         
         progress(0.5, desc=f"Đã tìm thấy {len(channel_urls)} kênh, đang lấy thông tin...")
         
-        # Lấy thông tin chi tiết
-        df = get_multiple_channels_from_urls_batch(channel_urls, API_KEY)
+        # Lấy thông tin chi tiết với API key rotation
+        df = get_multiple_channels_from_urls_batch(channel_urls)
         
         if df.empty:
             gr.Warning("Không lấy được thông tin kênh!")
@@ -431,7 +539,7 @@ def search_channels(hashtag, limit, progress=gr.Progress()):
         df_display['subscriberCount'] = df_display['subscriberCount'].apply(format_number)
         df_display['videoCount'] = df_display['videoCount'].apply(format_number)
         df_display['viewCount'] = df_display['viewCount'].apply(format_number)
-        df_display['publishedAt'] = pd.to_datetime(df_display['publishedAt'], format='ISO8601').dt.strftime('%Y-%m-%d')
+        df_display['publishedAt'] = pd.to_datetime(df_display['publishedAt']).dt.strftime('%Y-%m-%d')
         
         # Đổi tên cột cho dễ đọc
         df_display = df_display.rename(columns={
@@ -454,7 +562,11 @@ def search_channels(hashtag, limit, progress=gr.Progress()):
         
         progress(1.0, desc="Hoàn thành!")
         
-        return df_display, fig, excel_path, f"✅ Đã tìm thấy {len(df)} kênh!"
+        # Hiển thị thông tin API key được sử dụng
+        current_key = api_manager.get_current_key()
+        status_msg = f"✅ Đã tìm thấy {len(df)} kênh! (API Key: {current_key[:8]}...)"
+        
+        return df_display, fig, excel_path, status_msg
         
     except Exception as e:
         gr.Error(f"Lỗi: {str(e)}")
